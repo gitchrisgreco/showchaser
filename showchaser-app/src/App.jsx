@@ -1,0 +1,1110 @@
+import React, { useState, useMemo } from "react";
+import {
+  Music, MapPin, Calendar as CalendarIcon, Search, Heart, Share2,
+  ArrowLeft, Bell, Home as HomeIcon, Map as MapIcon, List as ListIcon,
+  Bookmark, User, Ticket, Navigation, Mountain, Sparkles, X, ChevronRight
+} from "lucide-react";
+
+/* ---------------------------------------------------------
+   ShowChaser — road-trip live music discovery, prototype
+   Palette: desert dusk. Deep pine header, terracotta accent,
+   sun-bleached sand cards, dashed "trail" as the wayfinding motif.
+--------------------------------------------------------- */
+
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap');`;
+
+/* ---------------------------------------------------------
+   Ticketmaster Discovery API — real data
+   NOTE: this is a dev/prototype key pasted in chat. Rotate it
+   in the Ticketmaster developer portal before any real launch.
+   Scope note: Discovery API searches by city, not by route —
+   so this pulls real shows near the origin and destination
+   cities, not truly "along the route" yet. That needs a
+   geocoding/routing API (e.g. Mapbox) layered on top later.
+--------------------------------------------------------- */
+const TICKETMASTER_API_KEY = "XxnONAEUBuv48hfFN7Xrl7oN5TelayBg";
+
+/* JamBase Data API — free Developer tier (non-commercial, 1,000 calls/mo).
+   NOTE: exact query param names weren't verifiable from JamBase's docs
+   (JS-rendered, not scrapable) — this uses the most standard REST
+   convention (city/stateCode). If this returns a 400, check
+   https://data.jambase.com/api/docs/request-builder for the exact
+   param names and we'll correct it. */
+const JAMBASE_API_KEY = "jbd_trial_9gvrBZCl1T5t_xH4X0a5ADxImA4jIlrpj5Vogm7mxPVTf";
+
+async function fetchOneJamBase(loc, label) {
+  const params = new URLSearchParams({ city: loc.city, stateCode: loc.stateCode });
+  const url = `https://data.jambase.com/v3/events?${params.toString()}`;
+  console.log(`[ShowChaser] Fetching JamBase ${label}:`, url);
+  let res;
+  try {
+    res = await fetch(url, { headers: { Authorization: `Bearer ${JAMBASE_API_KEY}` } });
+  } catch (networkErr) {
+    console.error(`[ShowChaser] JamBase network error (${label}) — likely blocked (CORS/sandbox):`, networkErr);
+    throw new Error(`network-blocked:jambase-${label}`);
+  }
+  console.log(`[ShowChaser] JamBase ${label} response status:`, res.status);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    console.error(`[ShowChaser] JamBase ${label} HTTP ${res.status} — check param names against Request Builder:`, body);
+    throw new Error(`http-${res.status}:jambase-${label}`);
+  }
+  return res.json();
+}
+
+function transformJamBaseEvent(event) {
+  const venue = event.venue || {};
+  return {
+    id: `jb-${event.identifier || event.id}`,
+    name: event.performer?.[0]?.name || event.name || "Live Music",
+    venue: venue.name || "Venue TBA",
+    city: venue.city && venue.stateCode ? `${venue.city}, ${venue.stateCode}` : "",
+    date: formatEventDate(event.startDate?.split?.("T")?.[0]),
+    time: formatEventTime(event.startDate?.split?.("T")?.[1]?.slice(0, 5)),
+    ages: "Check venue",
+    genres: ["Live Music"],
+    match: null,
+    detour: null,
+    price: "See site",
+    source: "JamBase",
+    ticketUrl: event.url || event.offers?.[0]?.url,
+    why: ["Found near your trip cities via JamBase", "Tickets available"],
+    nearby: [],
+  };
+}
+
+function parseCityState(input) {
+  const parts = (input || "").split(",").map((s) => s.trim());
+  return { city: parts[0] || "", stateCode: parts[1] || "" };
+}
+
+function formatEventDate(localDate) {
+  if (!localDate) return "Date TBA";
+  const d = new Date(`${localDate}T00:00:00`);
+  return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatEventTime(localTime) {
+  if (!localTime) return "Time TBA";
+  const [h, m] = localTime.split(":");
+  const hour = parseInt(h, 10);
+  const ampm = hour >= 12 ? "PM" : "AM";
+  const hour12 = hour % 12 === 0 ? 12 : hour % 12;
+  return `${hour12}:${m} ${ampm}`;
+}
+
+function transformTMEvent(event) {
+  const venue = event._embedded?.venues?.[0];
+  const genre = event.classifications?.[0]?.genre?.name;
+  const price = event.priceRanges?.[0]
+    ? `$${Math.round(event.priceRanges[0].min)}+`
+    : "See site";
+  return {
+    id: event.id,
+    name: event.name,
+    venue: venue?.name || "Venue TBA",
+    city: venue?.city?.name && venue?.state?.stateCode ? `${venue.city.name}, ${venue.state.stateCode}` : "",
+    date: formatEventDate(event.dates?.start?.localDate),
+    time: formatEventTime(event.dates?.start?.localTime),
+    ages: "Check venue",
+    genres: genre && genre !== "Undefined" ? [genre] : ["Live Music"],
+    match: null, // real match-scoring isn't wired up yet — see business logic notes
+    detour: null, // requires route/geocoding integration, not yet wired
+    price,
+    source: "Ticketmaster",
+    ticketUrl: event.url,
+    why: ["Found near your trip cities via Ticketmaster", "Tickets available"],
+    nearby: [],
+  };
+}
+
+async function fetchRealShows({ from, to, depart, arrive }) {
+  const fromLoc = parseCityState(from);
+  const toLoc = parseCityState(to);
+  const startDateTime = depart ? `${depart}T00:00:00Z` : undefined;
+  const endDateTime = arrive ? `${arrive}T23:59:59Z` : undefined;
+
+  const buildUrl = (loc) => {
+    const params = new URLSearchParams({
+      apikey: TICKETMASTER_API_KEY,
+      classificationName: "music",
+      size: "10",
+    });
+    if (loc.city) params.set("city", loc.city);
+    if (loc.stateCode) params.set("stateCode", loc.stateCode);
+    if (startDateTime) params.set("startDateTime", startDateTime);
+    if (endDateTime) params.set("endDateTime", endDateTime);
+    return `https://app.ticketmaster.com/discovery/v2/events.json?${params.toString()}`;
+  };
+
+  const fetchOne = async (loc, label) => {
+    const url = buildUrl(loc);
+    console.log(`[ShowChaser] Fetching ${label}:`, url);
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (networkErr) {
+      console.error(`[ShowChaser] Network error fetching ${label} — likely blocked (CORS/sandbox):`, networkErr);
+      throw new Error(`network-blocked:${label}`);
+    }
+    console.log(`[ShowChaser] ${label} response status:`, res.status);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`[ShowChaser] ${label} HTTP ${res.status}:`, body);
+      throw new Error(`http-${res.status}:${label}`);
+    }
+    const json = await res.json();
+    console.log(`[ShowChaser] ${label} events found:`, json?._embedded?.events?.length || 0);
+    return json;
+  };
+
+  const [fromRes, toRes, jbFromRes, jbToRes] = await Promise.allSettled([
+    fetchOne(fromLoc, "origin"),
+    fetchOne(toLoc, "destination"),
+    fetchOneJamBase(fromLoc, "origin"),
+    fetchOneJamBase(toLoc, "destination"),
+  ]);
+
+  // Log which sources actually came through vs failed, without letting
+  // one blocked/erroring source take down the other.
+  [
+    ["Ticketmaster origin", fromRes],
+    ["Ticketmaster destination", toRes],
+    ["JamBase origin", jbFromRes],
+    ["JamBase destination", jbToRes],
+  ].forEach(([label, r]) => {
+    if (r.status === "rejected") console.error(`[ShowChaser] ${label} failed:`, r.reason);
+  });
+
+  const fromEvents = fromRes.status === "fulfilled" ? fromRes.value?._embedded?.events || [] : [];
+  const toEvents = toRes.status === "fulfilled" ? toRes.value?._embedded?.events || [] : [];
+  const tmCombined = [...fromEvents, ...toEvents];
+
+  const seen = new Set();
+  const dedupedTM = tmCombined.filter((e) => {
+    if (seen.has(e.id)) return false;
+    seen.add(e.id);
+    return true;
+  });
+  const tmShows = dedupedTM.map(transformTMEvent);
+
+  const jbFromEvents = jbFromRes.status === "fulfilled" ? jbFromRes.value?.data || jbFromRes.value?.events || [] : [];
+  const jbToEvents = jbToRes.status === "fulfilled" ? jbToRes.value?.data || jbToRes.value?.events || [] : [];
+  const jbCombined = [...jbFromEvents, ...jbToEvents];
+  const jbShows = jbCombined.map(transformJamBaseEvent);
+
+  // If every single source failed outright (vs. just returning zero
+  // results), surface that as a real error rather than "no shows found."
+  const allFailed = [fromRes, toRes, jbFromRes, jbToRes].every((r) => r.status === "rejected");
+  if (allFailed) {
+    throw fromRes.reason || toRes.reason || jbFromRes.reason || jbToRes.reason;
+  }
+
+  const shows = [...tmShows, ...jbShows].sort((a, b) => new Date(a.date) - new Date(b.date));
+  // Spread evenly along the stylized map since we don't have real route positions yet.
+  return shows.map((s, i) => ({
+    ...s,
+    routePct: shows.length > 1 ? Math.round((i / (shows.length - 1)) * 90) + 5 : 50,
+  }));
+}
+
+const TOKENS = {
+  cream: "#F4EEDF",
+  sand: "#E7D9B8",
+  sandDark: "#D9C79E",
+  pine: "#2E4634",
+  pineDark: "#1F3225",
+  rust: "#C1440E",
+  rustDark: "#9E3609",
+  brown: "#6B4A2F",
+  ink: "#2A2620",
+  sky: "#F0DCC0",
+};
+
+const GENRES = ["Jam Bands", "Bluegrass", "Rock", "Indie", "Folk", "Electronic"];
+
+const SHOWS = [
+  {
+    id: "dirtwire",
+    name: "Dirtwire",
+    venue: "Ogden Theatre",
+    city: "Denver, CO",
+    date: "Sat, Jun 14, 2025",
+    time: "8:00 PM",
+    ages: "All Ages",
+    genres: ["Jam Bands", "Electronic"],
+    match: 96,
+    detour: 12,
+    routePct: 18,
+    price: "$32+",
+    source: "AXS",
+    why: ["Along your route", "Matches your music preferences", "Tickets available", "Outdoor-adjacent venue"],
+    nearby: [
+      { label: "Riverside campground", mins: 6, type: "camp", platform: "Hipcamp" },
+      { label: "Local brewery", mins: 4, type: "harvest", platform: "Harvest Hosts" },
+      { label: "Downtown hotel", mins: 3, type: "lodge", platform: "Hotels.com" },
+    ],
+  },
+  {
+    id: "stringdusters",
+    name: "The Infamous Stringdusters",
+    venue: "Dillon Amphitheater",
+    city: "Dillon, CO",
+    date: "Sun, Jun 15, 2025",
+    time: "7:30 PM",
+    ages: "All Ages",
+    genres: ["Bluegrass", "Folk"],
+    match: 94,
+    detour: 10,
+    routePct: 33,
+    price: "$28+",
+    source: "Tixr",
+    why: ["10 min off your route", "Matches your music preferences", "Tickets available", "Scenic mountain venue"],
+    nearby: [
+      { label: "RV park", mins: 8, type: "camp", platform: "Hipcamp" },
+      { label: "Lakeside camping", mins: 5, type: "camp", platform: "Hipcamp" },
+      { label: "Diner", mins: 2, type: "info" },
+    ],
+  },
+  {
+    id: "billystrings",
+    name: "Billy Strings",
+    venue: "The Great Saltair",
+    city: "Salt Lake City, UT",
+    date: "Tue, Jun 16, 2025",
+    time: "7:00 PM",
+    ages: "All Ages",
+    genres: ["Bluegrass", "Jam Bands"],
+    match: 95,
+    detour: 8,
+    routePct: 55,
+    price: "$45+",
+    source: "Ticketmaster",
+    why: ["8 min off your route", "Favorite-artist match", "Tickets available", "Iconic desert venue"],
+    nearby: [
+      { label: "Campground", mins: 10, type: "camp", platform: "Hipcamp" },
+      { label: "Hotel", mins: 4, type: "lodge", platform: "Hotels.com" },
+      { label: "Gas + supplies", mins: 2, type: "info" },
+    ],
+  },
+  {
+    id: "khruangbin",
+    name: "Khruangbin",
+    venue: "Grand Sierra Resort",
+    city: "Reno, NV",
+    date: "Thu, Jun 18, 2025",
+    time: "8:00 PM",
+    ages: "21+",
+    genres: ["Indie", "Electronic"],
+    match: 92,
+    detour: 15,
+    routePct: 78,
+    price: "$55+",
+    source: "AXS",
+    why: ["15 min off your route", "Matches your music preferences", "Tickets available", "Resort venue"],
+    nearby: [
+      { label: "Casino hotel", mins: 1, type: "lodge", platform: "Hotels.com" },
+      { label: "RV park", mins: 12, type: "camp", platform: "Hipcamp" },
+      { label: "Late-night eats", mins: 3, type: "info" },
+    ],
+  },
+  {
+    id: "phish",
+    name: "Phish",
+    venue: "Shoreline Amphitheatre",
+    city: "Mountain View, CA",
+    date: "Fri, Jun 20, 2025",
+    time: "7:00 PM",
+    ages: "All Ages",
+    genres: ["Jam Bands", "Rock"],
+    match: 99,
+    detour: 0,
+    routePct: 96,
+    price: "$68+",
+    source: "Ticketmaster",
+    why: ["Right on your route", "Favorite-artist match", "Tickets available", "Amphitheater venue"],
+    nearby: [
+      { label: "Vineyard campground", mins: 6, type: "harvest", platform: "Harvest Hosts" },
+      { label: "Local brewery", mins: 4, type: "harvest", platform: "Harvest Hosts" },
+      { label: "Hotel", mins: 3, type: "lodge", platform: "Hotels.com" },
+    ],
+  },
+];
+
+const RECENT_TRIPS = [
+  { from: "Boulder", to: "Telluride", dates: "May 23 – May 26" },
+  { from: "Boulder", to: "Las Vegas", dates: "Apr 10 – Apr 14" },
+  { from: "Denver", to: "Moab", dates: "Mar 28 – Mar 31" },
+];
+
+function MatchBadge({ match, size = "md" }) {
+  const big = size === "lg";
+  if (match === null || match === undefined) {
+    return (
+      <div
+        className="flex items-center justify-center rounded-full shrink-0"
+        style={{ width: big ? 56 : 44, height: big ? 56 : 44, background: TOKENS.sand, border: `1px solid ${TOKENS.sandDark}` }}
+      >
+        <Ticket size={big ? 20 : 16} color={TOKENS.brown} />
+      </div>
+    );
+  }
+  return (
+    <div
+      className="flex flex-col items-center justify-center rounded-full shrink-0"
+      style={{
+        width: big ? 56 : 44,
+        height: big ? 56 : 44,
+        background: TOKENS.pine,
+        color: TOKENS.cream,
+      }}
+    >
+      <span style={{ fontSize: big ? 16 : 13, fontWeight: 800, lineHeight: 1 }}>{match}%</span>
+      <span style={{ fontSize: 7, letterSpacing: 0.5, opacity: 0.8 }}>MATCH</span>
+    </div>
+  );
+}
+
+function SourceTag({ source }) {
+  return (
+    <span
+      className="inline-flex items-center px-1.5 py-0.5 rounded"
+      style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.3, color: TOKENS.brown, background: TOKENS.sand }}
+    >
+      via {source}
+    </span>
+  );
+}
+
+function ShowThumb({ genres, size = 64 }) {
+  // Stylized placeholder art keyed to genre, avoids fake photos.
+  const hue = genres.includes("Electronic") ? TOKENS.rust : genres.includes("Bluegrass") ? TOKENS.brown : TOKENS.pineDark;
+  return (
+    <div
+      className="rounded-xl shrink-0 flex items-center justify-center relative overflow-hidden"
+      style={{ width: size, height: size, background: `linear-gradient(155deg, ${hue}, ${TOKENS.ink})` }}
+    >
+      <Music size={size * 0.36} color={TOKENS.cream} strokeWidth={1.5} style={{ opacity: 0.9 }} />
+    </div>
+  );
+}
+
+function TopBar({ title, onBack, right }) {
+  return (
+    <div className="flex items-center justify-between px-5 pt-5 pb-3">
+      <div className="flex items-center gap-3">
+        {onBack && (
+          <button onClick={onBack} aria-label="Back" className="p-1 -ml-1 rounded-full active:opacity-60">
+            <ArrowLeft size={22} color={TOKENS.ink} />
+          </button>
+        )}
+        {title && (
+          <h1 style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 24, letterSpacing: 0.5, color: TOKENS.ink }}>
+            {title}
+          </h1>
+        )}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function BottomNav({ active, onChange }) {
+  const items = [
+    { id: "home", label: "Home", icon: HomeIcon },
+    { id: "trips", label: "Trips", icon: CalendarIcon },
+    { id: "saved", label: "Saved", icon: Bookmark },
+    { id: "profile", label: "Profile", icon: User },
+  ];
+  return (
+    <div
+      className="flex items-center justify-around border-t"
+      style={{ background: TOKENS.cream, borderColor: TOKENS.sandDark, paddingBottom: "env(safe-area-inset-bottom, 8px)" }}
+    >
+      {items.map((it) => {
+        const Icon = it.icon;
+        const isActive = active === it.id;
+        return (
+          <button
+            key={it.id}
+            onClick={() => onChange(it.id)}
+            className="flex flex-col items-center gap-1 py-2.5 px-3"
+          >
+            <Icon size={20} color={isActive ? TOKENS.rust : TOKENS.brown} strokeWidth={isActive ? 2.4 : 1.8} />
+            <span style={{ fontSize: 10, fontWeight: 600, color: isActive ? TOKENS.rust : TOKENS.brown }}>{it.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatTripDates(depart, arrive) {
+  if (!depart) return "No dates set";
+  const opts = { month: "short", day: "numeric" };
+  const d1 = new Date(`${depart}T00:00:00`).toLocaleDateString("en-US", opts);
+  if (!arrive) return d1;
+  const d2 = new Date(`${arrive}T00:00:00`).toLocaleDateString("en-US", opts);
+  return `${d1} – ${d2}`;
+}
+
+/* ---------------- Screens ---------------- */
+
+function HomeScreen({ onFindShows, hasTrip, tripSummary, foundCount }) {
+  return (
+    <div className="flex flex-col h-full">
+      <div className="px-5 pt-6 pb-2 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div
+            className="rounded-full flex items-center justify-center"
+            style={{ width: 34, height: 34, background: TOKENS.pine }}
+          >
+            <Mountain size={18} color={TOKENS.rust} strokeWidth={2} />
+          </div>
+          <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, color: TOKENS.pine, letterSpacing: 1 }}>
+            SHOWCHASER
+          </span>
+        </div>
+        <Bell size={20} color={TOKENS.brown} />
+      </div>
+
+      <div className="px-5 pt-3">
+        <h2 style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 34, lineHeight: 1.02, color: TOKENS.ink, letterSpacing: 0.3 }}>
+          Find live music
+          <br />
+          along your route.
+        </h2>
+      </div>
+
+      <div className="px-5 pt-5">
+        <div
+          className="rounded-2xl p-4"
+          style={{ background: TOKENS.sand, border: `1px solid ${TOKENS.sandDark}` }}
+        >
+          {hasTrip ? (
+            <>
+              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: TOKENS.ink }}>
+                <MapPin size={15} color={TOKENS.rust} />
+                {tripSummary.from} → {tripSummary.to}
+              </div>
+              <div style={{ color: TOKENS.brown, fontSize: 13 }} className="mt-1">
+                {tripSummary.dates}
+              </div>
+              <div className="flex items-center gap-1.5 mt-1.5" style={{ color: TOKENS.rust, fontSize: 13, fontWeight: 700 }}>
+                <Music size={13} /> {foundCount} shows found
+              </div>
+            </>
+          ) : (
+            <div style={{ color: TOKENS.brown, fontSize: 13 }}>
+              No trip planned yet — tell us where you're headed and we'll find the music along the way.
+            </div>
+          )}
+          <button
+            onClick={onFindShows}
+            className="w-full mt-3 rounded-xl py-3 font-bold text-sm flex items-center justify-center gap-2 active:opacity-90"
+            style={{ background: TOKENS.rust, color: TOKENS.cream }}
+          >
+            <Search size={16} /> {hasTrip ? "View shows" : "Find shows"}
+          </button>
+        </div>
+      </div>
+
+      <div className="px-5 pt-6 flex-1 overflow-y-auto">
+        <div className="flex items-center justify-between mb-2">
+          <span style={{ fontSize: 13, fontWeight: 700, color: TOKENS.ink }}>Recent trips</span>
+          <span style={{ fontSize: 12, color: TOKENS.rust, fontWeight: 600 }}>View all</span>
+        </div>
+        <div className="flex flex-col gap-2 pb-4">
+          {RECENT_TRIPS.map((t, i) => (
+            <div
+              key={i}
+              className="rounded-xl p-3 flex items-center gap-3"
+              style={{ background: TOKENS.cream, border: `1px solid ${TOKENS.sandDark}` }}
+            >
+              <div
+                className="rounded-lg shrink-0"
+                style={{ width: 44, height: 44, background: `linear-gradient(160deg, ${TOKENS.pine}, ${TOKENS.brown})` }}
+              />
+              <div className="flex-1">
+                <div style={{ fontSize: 13, fontWeight: 700, color: TOKENS.ink }}>
+                  {t.from} → {t.to}
+                </div>
+                <div style={{ fontSize: 11.5, color: TOKENS.brown }}>{t.dates}</div>
+              </div>
+              <ChevronRight size={16} color={TOKENS.brown} />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div className="mb-4">
+      <label style={{ fontSize: 11, fontWeight: 700, color: TOKENS.brown, letterSpacing: 0.4 }}>
+        {label.toUpperCase()}
+      </label>
+      <div className="mt-1.5">{children}</div>
+    </div>
+  );
+}
+
+function TripFormScreen({ onBack, onSubmit, form, setForm }) {
+  const toggleGenre = (g) => {
+    setForm((f) => ({
+      ...f,
+      genres: f.genres.includes(g) ? f.genres.filter((x) => x !== g) : [...f.genres, g],
+    }));
+  };
+
+  const inputStyle = {
+    background: TOKENS.cream,
+    border: `1px solid ${TOKENS.sandDark}`,
+    color: TOKENS.ink,
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <TopBar title="Plan Your Trip" onBack={onBack} />
+      <div className="px-5 flex-1 overflow-y-auto pb-4">
+        <Field label="From">
+          <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+            <MapPin size={15} color={TOKENS.rust} />
+            <input
+              value={form.from}
+              onChange={(e) => setForm((f) => ({ ...f, from: e.target.value }))}
+              className="flex-1 bg-transparent outline-none text-sm"
+              placeholder="City, state"
+            />
+          </div>
+        </Field>
+        <Field label="To">
+          <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+            <Navigation size={15} color={TOKENS.rust} />
+            <input
+              value={form.to}
+              onChange={(e) => setForm((f) => ({ ...f, to: e.target.value }))}
+              className="flex-1 bg-transparent outline-none text-sm"
+              placeholder="City, state"
+            />
+          </div>
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Depart">
+            <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+              <CalendarIcon size={14} color={TOKENS.rust} />
+              <input
+                type="date"
+                value={form.depart}
+                onChange={(e) => setForm((f) => ({ ...f, depart: e.target.value }))}
+                className="flex-1 bg-transparent outline-none text-xs"
+              />
+            </div>
+          </Field>
+          <Field label="Arrive">
+            <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+              <CalendarIcon size={14} color={TOKENS.rust} />
+              <input
+                type="date"
+                value={form.arrive}
+                onChange={(e) => setForm((f) => ({ ...f, arrive: e.target.value }))}
+                className="flex-1 bg-transparent outline-none text-xs"
+              />
+            </div>
+          </Field>
+        </div>
+
+        <Field label="Music preferences">
+          <div className="flex flex-wrap gap-2">
+            {GENRES.map((g) => {
+              const active = form.genres.includes(g);
+              return (
+                <button
+                  key={g}
+                  onClick={() => toggleGenre(g)}
+                  className="px-3 py-1.5 rounded-full text-xs font-semibold"
+                  style={{
+                    background: active ? TOKENS.rust : TOKENS.cream,
+                    color: active ? TOKENS.cream : TOKENS.ink,
+                    border: `1px solid ${active ? TOKENS.rust : TOKENS.sandDark}`,
+                  }}
+                >
+                  {g}
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+
+        <Field label="Maximum detour">
+          <div className="flex gap-2">
+            {["15 min", "30 min", "60 min", "Unlimited"].map((d) => (
+              <button
+                key={d}
+                onClick={() => setForm((f) => ({ ...f, maxDetour: d }))}
+                className="flex-1 py-2 rounded-xl text-xs font-semibold"
+                style={{
+                  background: form.maxDetour === d ? TOKENS.rust : TOKENS.cream,
+                  color: form.maxDetour === d ? TOKENS.cream : TOKENS.ink,
+                  border: `1px solid ${form.maxDetour === d ? TOKENS.rust : TOKENS.sandDark}`,
+                }}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        </Field>
+      </div>
+      <div className="px-5 pb-5 pt-2">
+        <button
+          onClick={onSubmit}
+          className="w-full rounded-xl py-3.5 font-bold text-sm flex items-center justify-center gap-2 active:opacity-90"
+          style={{ background: TOKENS.rust, color: TOKENS.cream }}
+        >
+          <Music size={16} /> Show me the music
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RouteMap({ shows, selectedId, onSelect }) {
+  // Stylized route: dashed trail across a desert horizon, pins placed by routePct.
+  return (
+    <div
+      className="relative rounded-2xl overflow-hidden"
+      style={{ height: 230, background: `linear-gradient(180deg, ${TOKENS.sky} 0%, ${TOKENS.sand} 65%, ${TOKENS.sandDark} 100%)` }}
+    >
+      <svg viewBox="0 0 400 230" className="absolute inset-0 w-full h-full" preserveAspectRatio="none">
+        <polygon points="0,150 60,95 110,150" fill={TOKENS.pineDark} opacity="0.25" />
+        <polygon points="70,155 140,80 210,155" fill={TOKENS.pineDark} opacity="0.35" />
+        <polygon points="190,150 260,100 320,150" fill={TOKENS.brown} opacity="0.25" />
+        <path
+          d="M 20 190 C 100 160, 140 200, 200 150 S 320 120, 380 60"
+          fill="none"
+          stroke={TOKENS.rustDark}
+          strokeWidth="3"
+          strokeDasharray="2 8"
+          strokeLinecap="round"
+        />
+      </svg>
+      {/* start/end markers */}
+      <div className="absolute" style={{ left: "5%", bottom: 14 }}>
+        <div className="w-3 h-3 rounded-full" style={{ background: TOKENS.pine, border: `2px solid ${TOKENS.cream}` }} />
+      </div>
+      <div className="absolute" style={{ right: "5%", top: 20 }}>
+        <div className="w-3 h-3 rounded-full" style={{ background: TOKENS.pine, border: `2px solid ${TOKENS.cream}` }} />
+      </div>
+      {shows.map((s) => {
+        const left = `${8 + s.routePct * 0.84}%`;
+        const top = `${68 - s.routePct * 0.4}%`;
+        const isSel = s.id === selectedId;
+        return (
+          <button
+            key={s.id}
+            onClick={() => onSelect(s.id)}
+            className="absolute -translate-x-1/2 -translate-y-full flex flex-col items-center"
+            style={{ left, top }}
+          >
+            <div
+              className="rounded-full flex items-center justify-center shadow"
+              style={{
+                width: isSel ? 30 : 24,
+                height: isSel ? 30 : 24,
+                background: TOKENS.rust,
+                border: `2px solid ${TOKENS.cream}`,
+                transition: "all 0.15s",
+              }}
+            >
+              <Music size={isSel ? 14 : 11} color={TOKENS.cream} />
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ResultsScreen({ onBack, shows, view, setView, onOpenShow, form, usingLiveData, fetchError }) {
+  const sorted = useMemo(() => [...shows].sort((a, b) => (b.match ?? 0) - (a.match ?? 0)), [shows]);
+  const [selectedId, setSelectedId] = useState(sorted[0]?.id);
+  const selected = sorted.find((s) => s.id === selectedId) || sorted[0];
+
+  return (
+    <div className="flex flex-col h-full">
+      <TopBar
+        onBack={onBack}
+        title={null}
+        right={null}
+      />
+      <div className="px-5 -mt-1 pb-2">
+        <div style={{ fontSize: 13, fontWeight: 700, color: TOKENS.ink }}>
+          {form.from || "Boulder, CO"} → {form.to || "San Francisco, CA"}
+        </div>
+        <div style={{ fontSize: 11.5, color: TOKENS.brown }}>
+          {sorted.length} shows found · {usingLiveData ? "Sorted by date" : "Sorted by best match"}
+        </div>
+        <div className="mt-1.5">
+          {usingLiveData ? (
+            <span
+              className="inline-flex items-center px-2 py-0.5 rounded-full"
+              style={{ fontSize: 10, fontWeight: 700, color: TOKENS.cream, background: TOKENS.pine }}
+            >
+              ● Live results
+            </span>
+          ) : (
+            <span
+              className="inline-flex items-center px-2 py-0.5 rounded-full"
+              style={{ fontSize: 10, fontWeight: 700, color: TOKENS.brown, background: TOKENS.sand }}
+            >
+              Sample data
+            </span>
+          )}
+        </div>
+        {fetchError && (
+          <div style={{ fontSize: 11, color: TOKENS.rust, marginTop: 4 }}>{fetchError}</div>
+        )}
+      </div>
+
+      <div className="px-5 flex-1 overflow-y-auto pb-2">
+        {view === "map" ? (
+          <>
+            <RouteMap shows={sorted} selectedId={selectedId} onSelect={setSelectedId} />
+            {selected && (
+              <button
+                onClick={() => onOpenShow(selected)}
+                className="w-full mt-3 rounded-2xl p-3 flex items-center gap-3 text-left"
+                style={{ background: TOKENS.sand, border: `1px solid ${TOKENS.sandDark}` }}
+              >
+                <ShowThumb genres={selected.genres} size={56} />
+                <div className="flex-1 min-w-0">
+                  <div style={{ fontSize: 14, fontWeight: 800, color: TOKENS.ink }}>{selected.name}</div>
+                  <div style={{ fontSize: 12, color: TOKENS.brown }}>
+                    {selected.venue} · {selected.city}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: TOKENS.rust, fontWeight: 700 }}>
+                    {selected.date} · {selected.detour === null || selected.detour === undefined ? "Near your trip" : selected.detour === 0 ? "On your route" : `${selected.detour} min detour`}
+                  </div>
+                  <div className="mt-1">
+                    <SourceTag source={selected.source} />
+                  </div>
+                </div>
+                <MatchBadge match={selected.match} />
+              </button>
+            )}
+          </>
+        ) : (
+          <div className="flex flex-col gap-2.5 pt-1">
+            {sorted.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => onOpenShow(s)}
+                className="w-full rounded-2xl p-3 flex items-center gap-3 text-left"
+                style={{ background: TOKENS.cream, border: `1px solid ${TOKENS.sandDark}` }}
+              >
+                <ShowThumb genres={s.genres} size={56} />
+                <div className="flex-1 min-w-0">
+                  <div style={{ fontSize: 14, fontWeight: 800, color: TOKENS.ink }}>{s.name}</div>
+                  <div style={{ fontSize: 12, color: TOKENS.brown }}>
+                    {s.venue} · {s.city}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: TOKENS.rust, fontWeight: 700 }}>
+                    {s.date} · {s.detour === null || s.detour === undefined ? "Near your trip" : s.detour === 0 ? "0 min detour" : `${s.detour} min detour`}
+                  </div>
+                  <div className="mt-1">
+                    <SourceTag source={s.source} />
+                  </div>
+                </div>
+                <MatchBadge match={s.match} />
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center justify-center gap-2 px-5 py-3">
+        {[
+          { id: "map", label: "Map", icon: MapIcon },
+          { id: "list", label: "List", icon: ListIcon },
+        ].map((v) => {
+          const Icon = v.icon;
+          const active = view === v.id;
+          return (
+            <button
+              key={v.id}
+              onClick={() => setView(v.id)}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-bold"
+              style={{
+                background: active ? TOKENS.pine : TOKENS.sand,
+                color: active ? TOKENS.cream : TOKENS.brown,
+              }}
+            >
+              <Icon size={13} /> {v.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ShowDetailScreen({ show, onBack, saved, onToggleSave }) {
+  if (!show) return null;
+  const isSaved = saved.includes(show.id);
+  return (
+    <div className="flex flex-col h-full">
+      <TopBar
+        onBack={onBack}
+        right={
+          <div className="flex items-center gap-3">
+            <Share2 size={19} color={TOKENS.brown} />
+            <button onClick={() => onToggleSave(show.id)}>
+              <Heart size={20} color={TOKENS.rust} fill={isSaved ? TOKENS.rust : "none"} />
+            </button>
+          </div>
+        }
+      />
+      <div className="flex-1 overflow-y-auto px-5 pb-4">
+        <div
+          className="rounded-2xl w-full flex items-center justify-center mb-4 relative overflow-hidden"
+          style={{ height: 150, background: `linear-gradient(155deg, ${TOKENS.pineDark}, ${TOKENS.rustDark})` }}
+        >
+          <Music size={44} color={TOKENS.cream} strokeWidth={1.3} style={{ opacity: 0.85 }} />
+        </div>
+
+        <h1 style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 32, color: TOKENS.ink, letterSpacing: 0.5 }}>
+          {show.name}
+        </h1>
+        <div style={{ fontSize: 14, fontWeight: 700, color: TOKENS.brown }}>{show.venue}</div>
+        <div style={{ fontSize: 12.5, color: TOKENS.brown }} className="flex items-center gap-3 mt-1">
+          <span className="flex items-center gap-1"><CalendarIcon size={12} /> {show.date}</span>
+          <span>{show.time}</span>
+          <span>{show.ages}</span>
+        </div>
+        <div className="mt-1.5">
+          <SourceTag source={show.source} />
+        </div>
+
+        <div
+          className="mt-4 rounded-xl px-3.5 py-2.5 flex items-center justify-between"
+          style={{ background: TOKENS.sand }}
+        >
+          <span style={{ fontSize: 12.5, fontWeight: 600, color: TOKENS.ink }}>
+            {show.detour === null || show.detour === undefined ? "Near your trip cities" : show.detour === 0 ? "Right on your route" : `${show.detour} minutes off your route`}
+          </span>
+          <MatchBadge match={show.match} />
+        </div>
+
+        <div className="mt-5">
+          <div style={{ fontSize: 11, fontWeight: 700, color: TOKENS.brown, letterSpacing: 0.4 }}>WHY THIS MATCHES</div>
+          <div className="flex flex-col gap-1.5 mt-2">
+            {show.why.map((w, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Sparkles size={12} color={TOKENS.rust} />
+                <span style={{ fontSize: 13, color: TOKENS.ink }}>{w}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-5">
+          <div className="flex items-center justify-between">
+            <span style={{ fontSize: 11, fontWeight: 700, color: TOKENS.brown, letterSpacing: 0.4 }}>NEARBY</span>
+            <span style={{ fontSize: 11.5, color: TOKENS.rust, fontWeight: 700 }}>View map</span>
+          </div>
+          <div className="flex flex-col gap-2 mt-2">
+            {show.nearby.map((n, i) => {
+              const cta =
+                n.type === "camp" || n.type === "lodge" ? "Book" : n.type === "harvest" ? "View" : null;
+              return (
+                <div key={i} className="flex items-center justify-between">
+                  <div>
+                    <div style={{ fontSize: 13, color: TOKENS.ink }}>{n.label}</div>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span style={{ fontSize: 11.5, color: TOKENS.brown }}>
+                        {n.mins} min{n.type === "harvest" ? " · free stay for members" : ""}
+                      </span>
+                      {n.platform && <SourceTag source={n.platform} />}
+                    </div>
+                  </div>
+                  {cta && (
+                    <button
+                      className="px-3 py-1.5 rounded-full text-xs font-bold shrink-0"
+                      style={{
+                        background: n.type === "harvest" ? TOKENS.pine : TOKENS.sand,
+                        color: n.type === "harvest" ? TOKENS.cream : TOKENS.ink,
+                      }}
+                    >
+                      {cta}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="px-5 pb-5 pt-2 flex flex-col gap-2">
+        <button
+          onClick={() => show.ticketUrl && window.open(show.ticketUrl, "_blank")}
+          className="w-full rounded-xl py-3.5 font-bold text-sm flex items-center justify-center gap-2"
+          style={{ background: TOKENS.rust, color: TOKENS.cream }}
+        >
+          <Ticket size={16} /> Get tickets · {show.price}
+        </button>
+        <div className="flex gap-2">
+          <button
+            className="flex-1 rounded-xl py-2.5 font-semibold text-xs"
+            style={{ background: TOKENS.sand, color: TOKENS.ink, border: `1px solid ${TOKENS.sandDark}` }}
+          >
+            Add to trip
+          </button>
+          <button
+            className="flex-1 rounded-xl py-2.5 font-semibold text-xs"
+            style={{ background: TOKENS.sand, color: TOKENS.ink, border: `1px solid ${TOKENS.sandDark}` }}
+          >
+            Share
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- App shell ---------------- */
+
+export default function ShowChaserApp() {
+  const [screen, setScreen] = useState("home"); // home | trip | results | detail
+  const [navActive, setNavActive] = useState("home");
+  const [view, setView] = useState("map");
+  const [saved, setSaved] = useState([]);
+  const [hasTrip, setHasTrip] = useState(false);
+  const [selectedShow, setSelectedShow] = useState(null);
+  const [liveShows, setLiveShows] = useState(null); // null = no live fetch yet
+  const [loadingShows, setLoadingShows] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
+  const [form, setForm] = useState({
+    from: "Boulder, CO",
+    to: "San Francisco, CA",
+    depart: "2026-09-01",
+    arrive: "2026-09-30",
+    genres: ["Jam Bands", "Bluegrass"],
+    maxDetour: "30 min",
+  });
+
+  const sampleFiltered = useMemo(() => {
+    if (form.genres.length === 0) return SHOWS;
+    return SHOWS.filter((s) => s.genres.some((g) => form.genres.includes(g)));
+  }, [form.genres]);
+
+  const filteredShows = liveShows !== null ? liveShows : sampleFiltered;
+  const usingLiveData = liveShows !== null && liveShows.length > 0;
+
+  const toggleSave = (id) => {
+    setSaved((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  };
+
+  const handleFindShows = async () => {
+    setHasTrip(true);
+    setScreen("results");
+    setLoadingShows(true);
+    setFetchError(null);
+    try {
+      const results = await fetchRealShows(form);
+      setLiveShows(results.length > 0 ? results : null);
+      if (results.length === 0) setFetchError("No live results for these cities/dates — showing sample shows instead.");
+    } catch (e) {
+      console.error("[ShowChaser] Live search failed:", e);
+      if (String(e.message).startsWith("network-blocked")) {
+        setFetchError("Live search is blocked in this preview environment — showing sample shows instead.");
+      } else {
+        setFetchError("Ticketmaster request failed — showing sample shows instead.");
+      }
+      setLiveShows(null);
+    } finally {
+      setLoadingShows(false);
+    }
+  };
+
+  return (
+    <div
+      className="w-full flex justify-center"
+      style={{ background: "#EDE4CF", minHeight: 600, padding: "24px 12px", fontFamily: "'Inter', sans-serif" }}
+    >
+      <style>{FONT_IMPORT}</style>
+      <div
+        className="relative flex flex-col overflow-hidden"
+        style={{
+          width: 390,
+          height: 720,
+          background: TOKENS.cream,
+          borderRadius: 36,
+          boxShadow: "0 20px 60px rgba(31,50,37,0.25)",
+          border: `8px solid ${TOKENS.ink}`,
+        }}
+      >
+        <div className="flex-1 overflow-hidden">
+          {screen === "home" && (
+            <HomeScreen
+              hasTrip={hasTrip}
+              tripSummary={{ from: form.from, to: form.to, dates: formatTripDates(form.depart, form.arrive) }}
+              foundCount={filteredShows.length}
+              onFindShows={() => setScreen("trip")}
+            />
+          )}
+          {screen === "trip" && (
+            <TripFormScreen
+              form={form}
+              setForm={setForm}
+              onBack={() => setScreen("home")}
+              onSubmit={handleFindShows}
+            />
+          )}
+          {screen === "results" && loadingShows && (
+            <div className="flex flex-col items-center justify-center h-full gap-3 px-8 text-center">
+              <Music size={28} color={TOKENS.rust} className="animate-pulse" />
+              <span style={{ fontSize: 13, fontWeight: 600, color: TOKENS.brown }}>
+                Searching live shows near {form.from} and {form.to}…
+              </span>
+            </div>
+          )}
+          {screen === "results" && !loadingShows && (
+            <ResultsScreen
+              onBack={() => setScreen("home")}
+              shows={filteredShows}
+              view={view}
+              setView={setView}
+              form={form}
+              usingLiveData={usingLiveData}
+              fetchError={fetchError}
+              onOpenShow={(s) => {
+                setSelectedShow(s);
+                setScreen("detail");
+              }}
+            />
+          )}
+          {screen === "detail" && (
+            <ShowDetailScreen
+              show={selectedShow}
+              saved={saved}
+              onToggleSave={toggleSave}
+              onBack={() => setScreen("results")}
+            />
+          )}
+        </div>
+        {(screen === "home") && (
+          <BottomNav
+            active={navActive}
+            onChange={(id) => {
+              setNavActive(id);
+              if (id === "home") setScreen("home");
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
