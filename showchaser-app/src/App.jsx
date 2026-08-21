@@ -189,9 +189,21 @@ function transformTMEvent(event) {
   };
 }
 
-async function fetchTicketmasterNear(point, depart, arrive, label) {
-  const startDateTime = depart ? `${depart}T00:00:00Z` : undefined;
-  const endDateTime = arrive ? `${arrive}T23:59:59Z` : undefined;
+function addDays(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysBetween(start, end) {
+  const d1 = new Date(`${start}T00:00:00`);
+  const d2 = new Date(`${end}T00:00:00`);
+  return Math.round((d2 - d1) / 86400000);
+}
+
+async function fetchTicketmasterNear(point, windowStart, windowEnd, label) {
+  const startDateTime = windowStart ? `${windowStart}T00:00:00Z` : undefined;
+  const endDateTime = windowEnd ? `${windowEnd}T23:59:59Z` : undefined;
   const params = new URLSearchParams({
     apikey: TICKETMASTER_API_KEY,
     classificationName: "music",
@@ -203,7 +215,7 @@ async function fetchTicketmasterNear(point, depart, arrive, label) {
   if (startDateTime) params.set("startDateTime", startDateTime);
   if (endDateTime) params.set("endDateTime", endDateTime);
   const url = `https://app.ticketmaster.com/discovery/v2/events.json?${params.toString()}`;
-  console.log(`[ShowChaser] Fetching Ticketmaster near ${label}:`, url);
+  console.log(`[ShowChaser] Fetching Ticketmaster near ${label} (window ${windowStart} to ${windowEnd}):`, url);
   let res;
   try {
     res = await fetch(url);
@@ -222,6 +234,54 @@ async function fetchTicketmasterNear(point, depart, arrive, label) {
   return json?._embedded?.events || [];
 }
 
+function encodePolyline(points) {
+  // Standard encoded-polyline algorithm (precision 5), points as [lat, lon].
+  let output = "";
+  let prevLat = 0;
+  let prevLon = 0;
+  const encodeValue = (val) => {
+    let v = val < 0 ? ~(val << 1) : val << 1;
+    let result = "";
+    while (v >= 0x20) {
+      result += String.fromCharCode((0x20 | (v & 0x1f)) + 63);
+      v >>= 5;
+    }
+    result += String.fromCharCode(v + 63);
+    return result;
+  };
+  for (const [lat, lon] of points) {
+    const latInt = Math.round(lat * 1e5);
+    const lonInt = Math.round(lon * 1e5);
+    output += encodeValue(latInt - prevLat);
+    output += encodeValue(lonInt - prevLon);
+    prevLat = latInt;
+    prevLon = lonInt;
+  }
+  return output;
+}
+
+function decimateCoords(coords, maxPoints) {
+  if (coords.length <= maxPoints) return coords;
+  const step = (coords.length - 1) / (maxPoints - 1);
+  const out = [];
+  for (let i = 0; i < maxPoints; i++) out.push(coords[Math.round(i * step)]);
+  return out;
+}
+
+function buildStaticMapUrl({ routeCoords, shows, selectedId, width = 640, height = 420 }) {
+  if (!routeCoords || routeCoords.length === 0) return null;
+  const decimated = decimateCoords(routeCoords, 100);
+  const encoded = encodePolyline(decimated.map(([lon, lat]) => [lat, lon]));
+  const pathOverlay = `path-3+c1440e-0.85(${encodeURIComponent(encoded)})`;
+  const pinnable = shows.filter((s) => typeof s._lat === "number" && !isNaN(s._lat)).slice(0, 15);
+  const markerOverlays = pinnable.map((s) => {
+    const color = s.id === selectedId ? "c1440e" : "2e4634";
+    return `pin-s+${color}(${s._lon.toFixed(4)},${s._lat.toFixed(4)})`;
+  });
+  const overlay = [pathOverlay, ...markerOverlays].join(",");
+  return `https://api.mapbox.com/styles/v1/mapbox/light-v11/static/${overlay}/auto/${width}x${height}@2x?padding=50&access_token=${MAPBOX_TOKEN}`;
+}
+
 async function fetchRealShows({ from, to, depart, arrive }) {
   // Step 1: geocode both endpoints, then get the real driving route between them.
   const [fromCoord, toCoord] = await Promise.all([
@@ -233,9 +293,25 @@ async function fetchRealShows({ from, to, depart, arrive }) {
   // Step 2: sample ~6 points along the actual route (not just the two ends).
   const routePoints = sampleRoutePoints(routeCoords, 6);
 
-  // Step 3: search Ticketmaster near each sampled point, in parallel.
+  // Step 3: estimate which day of the trip you'd actually be near each
+  // waypoint (assuming a roughly steady pace from depart to arrive), and
+  // only search that waypoint within a day or two of that estimate —
+  // not the whole trip's date range. Otherwise a Nebraska waypoint pulls
+  // shows from every day of the month, even days you'd already be in Chicago.
+  const tripDays = depart && arrive ? daysBetween(depart, arrive) : 0;
+  const bufferDays = 1;
   const tmResults = await Promise.allSettled(
-    routePoints.map((pt, i) => fetchTicketmasterNear(pt, depart, arrive, `waypoint-${i}`))
+    routePoints.map((pt, i) => {
+      let windowStart = depart;
+      let windowEnd = arrive || depart;
+      if (depart && arrive && tripDays > 0) {
+        const fraction = i / (routePoints.length - 1);
+        const estimatedOffset = Math.round(fraction * tripDays);
+        windowStart = addDays(depart, Math.max(0, estimatedOffset - bufferDays));
+        windowEnd = addDays(depart, Math.min(tripDays, estimatedOffset + bufferDays));
+      }
+      return fetchTicketmasterNear(pt, windowStart, windowEnd, `waypoint-${i}`);
+    })
   );
   tmResults.forEach((r, i) => {
     if (r.status === "rejected") console.error(`[ShowChaser] Ticketmaster waypoint-${i} failed:`, r.reason);
@@ -287,7 +363,10 @@ async function fetchRealShows({ from, to, depart, arrive }) {
     routePct: arr.length > 1 ? Math.round((i / (arr.length - 1)) * 90) + 5 : 50,
   }));
 
-  return [...tmShows, ...jbShows].sort((a, b) => new Date(a.date) - new Date(b.date));
+  return {
+    shows: [...tmShows, ...jbShows].sort((a, b) => new Date(a.date) - new Date(b.date)),
+    routeCoords,
+  };
 }
 
 function parseCityState(input) {
@@ -759,8 +838,26 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
   );
 }
 
-function RouteMap({ shows, selectedId, onSelect }) {
-  // Stylized route: dashed trail across a desert horizon, pins placed by routePct.
+function RouteMap({ shows, selectedId, onSelect, routeCoords }) {
+  // Real map: when we have an actual driving route (live search), render a
+  // genuine Mapbox static image with the real path and real venue pins.
+  if (routeCoords && routeCoords.length > 0) {
+    const mapUrl = buildStaticMapUrl({ routeCoords, shows, selectedId });
+    return (
+      <div className="rounded-2xl overflow-hidden" style={{ height: 230, background: TOKENS.sand }}>
+        {mapUrl && (
+          <img
+            src={mapUrl}
+            alt="Map of your route with nearby shows"
+            className="w-full h-full object-cover"
+          />
+        )}
+      </div>
+    );
+  }
+
+  // Stylized fallback: dashed trail across a desert horizon, used for sample
+  // data or when live search hasn't produced real route coordinates.
   return (
     <div
       className="relative rounded-2xl overflow-hidden"
@@ -816,7 +913,7 @@ function RouteMap({ shows, selectedId, onSelect }) {
   );
 }
 
-function ResultsScreen({ onBack, shows, view, setView, onOpenShow, form, usingLiveData, fetchError }) {
+function ResultsScreen({ onBack, shows, view, setView, onOpenShow, form, usingLiveData, fetchError, routeCoords }) {
   const sorted = useMemo(() => [...shows].sort((a, b) => (b.match ?? 0) - (a.match ?? 0)), [shows]);
   const [selectedId, setSelectedId] = useState(sorted[0]?.id);
   const selected = sorted.find((s) => s.id === selectedId) || sorted[0];
@@ -860,7 +957,7 @@ function ResultsScreen({ onBack, shows, view, setView, onOpenShow, form, usingLi
       <div className="px-5 flex-1 overflow-y-auto pb-2">
         {view === "map" ? (
           <>
-            <RouteMap shows={sorted} selectedId={selectedId} onSelect={setSelectedId} />
+            <RouteMap shows={sorted} selectedId={selectedId} onSelect={setSelectedId} routeCoords={routeCoords} />
             {selected && (
               <button
                 onClick={() => onOpenShow(selected)}
@@ -1073,6 +1170,7 @@ export default function ShowChaserApp() {
   const [hasTrip, setHasTrip] = useState(false);
   const [selectedShow, setSelectedShow] = useState(null);
   const [liveShows, setLiveShows] = useState(null); // null = no live fetch yet
+  const [liveRouteCoords, setLiveRouteCoords] = useState(null);
   const [loadingShows, setLoadingShows] = useState(false);
   const [fetchError, setFetchError] = useState(null);
   const [form, setForm] = useState({
@@ -1102,8 +1200,9 @@ export default function ShowChaserApp() {
     setLoadingShows(true);
     setFetchError(null);
     try {
-      const results = await fetchRealShows(form);
+      const { shows: results, routeCoords } = await fetchRealShows(form);
       setLiveShows(results.length > 0 ? results : null);
+      setLiveRouteCoords(results.length > 0 ? routeCoords : null);
       if (results.length === 0) setFetchError("No live results for these cities/dates — showing sample shows instead.");
     } catch (e) {
       console.error("[ShowChaser] Live search failed:", e);
@@ -1118,6 +1217,7 @@ export default function ShowChaserApp() {
         setFetchError("Live search request failed — showing sample shows instead.");
       }
       setLiveShows(null);
+      setLiveRouteCoords(null);
     } finally {
       setLoadingShows(false);
     }
@@ -1174,6 +1274,7 @@ export default function ShowChaserApp() {
               form={form}
               usingLiveData={usingLiveData}
               fetchError={fetchError}
+              routeCoords={usingLiveData ? liveRouteCoords : null}
               onOpenShow={(s) => {
                 setSelectedShow(s);
                 setScreen("detail");
@@ -1202,4 +1303,3 @@ export default function ShowChaserApp() {
     </div>
   );
 }
-
