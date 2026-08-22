@@ -203,6 +203,12 @@ function formatEventDate(localDate) {
   return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
 }
 
+function formatShortDate(isoDate) {
+  if (!isoDate) return "";
+  const d = new Date(`${isoDate}T00:00:00`);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
 function formatEventTime(localTime) {
   if (!localTime) return "Time TBA";
   const [h, m] = localTime.split(":");
@@ -764,26 +770,32 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Depart">
-            <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+            <div className="relative flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
               <CalendarIcon size={14} color={TOKENS.rust} />
+              <span className="flex-1 text-xs" style={{ color: form.depart ? TOKENS.ink : TOKENS.brown }}>
+                {form.depart ? formatShortDate(form.depart) : "Select date"}
+              </span>
               <input
                 type="date"
-                lang="en-US"
                 value={form.depart}
                 onChange={(e) => setForm((f) => ({ ...f, depart: e.target.value }))}
-                className="flex-1 bg-transparent outline-none text-xs"
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                aria-label="Depart date"
               />
             </div>
           </Field>
           <Field label="Arrive">
-            <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
+            <div className="relative flex items-center gap-2 rounded-xl px-3 py-2.5" style={inputStyle}>
               <CalendarIcon size={14} color={TOKENS.rust} />
+              <span className="flex-1 text-xs" style={{ color: form.arrive ? TOKENS.ink : TOKENS.brown }}>
+                {form.arrive ? formatShortDate(form.arrive) : "Select date"}
+              </span>
               <input
                 type="date"
-                lang="en-US"
                 value={form.arrive}
                 onChange={(e) => setForm((f) => ({ ...f, arrive: e.target.value }))}
-                className="flex-1 bg-transparent outline-none text-xs"
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                aria-label="Arrive date"
               />
             </div>
           </Field>
