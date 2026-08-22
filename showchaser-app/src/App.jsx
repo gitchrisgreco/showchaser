@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useRef } from "react";
 import {
   Music, MapPin, Calendar as CalendarIcon, Search, Heart, Share2,
   ArrowLeft, Bell, Home as HomeIcon, Map as MapIcon, List as ListIcon,
@@ -1194,17 +1194,30 @@ export default function ShowChaserApp() {
     setSaved((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   };
 
+  // Guards against a race condition: if the user navigates back and searches
+  // again before a slower earlier request finishes, that stale response
+  // could land AFTER the newer one and silently overwrite it — causing the
+  // shows/pins/count to flicker between searches. Each search gets a unique
+  // id; only the response matching the current id is ever applied.
+  const searchIdRef = useRef(0);
+
   const handleFindShows = async () => {
+    const thisSearchId = ++searchIdRef.current;
     setHasTrip(true);
     setScreen("results");
     setLoadingShows(true);
     setFetchError(null);
     try {
       const { shows: results, routeCoords } = await fetchRealShows(form);
+      if (searchIdRef.current !== thisSearchId) {
+        console.log("[ShowChaser] Ignoring stale search result", thisSearchId, "current is", searchIdRef.current);
+        return;
+      }
       setLiveShows(results.length > 0 ? results : null);
       setLiveRouteCoords(results.length > 0 ? routeCoords : null);
       if (results.length === 0) setFetchError("No live results for these cities/dates — showing sample shows instead.");
     } catch (e) {
+      if (searchIdRef.current !== thisSearchId) return;
       console.error("[ShowChaser] Live search failed:", e);
       const msg = String(e.message || "");
       if (msg.startsWith("network-blocked")) {
@@ -1219,7 +1232,7 @@ export default function ShowChaserApp() {
       setLiveShows(null);
       setLiveRouteCoords(null);
     } finally {
-      setLoadingShows(false);
+      if (searchIdRef.current === thisSearchId) setLoadingShows(false);
     }
   };
 
