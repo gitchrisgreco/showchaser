@@ -720,6 +720,7 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
               <CalendarIcon size={14} color={TOKENS.rust} />
               <input
                 type="date"
+                lang="en-US"
                 value={form.depart}
                 onChange={(e) => setForm((f) => ({ ...f, depart: e.target.value }))}
                 className="flex-1 bg-transparent outline-none text-xs"
@@ -731,6 +732,7 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
               <CalendarIcon size={14} color={TOKENS.rust} />
               <input
                 type="date"
+                lang="en-US"
                 value={form.arrive}
                 onChange={(e) => setForm((f) => ({ ...f, arrive: e.target.value }))}
                 className="flex-1 bg-transparent outline-none text-xs"
