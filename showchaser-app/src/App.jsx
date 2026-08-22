@@ -108,13 +108,25 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function fetchOneJamBase(loc, label) {
-  const params = new URLSearchParams({ city: loc.city, stateCode: loc.stateCode });
-  const url = `https://data.jambase.com/v3/events?${params.toString()}`;
+async function fetchJamBaseNear(point, windowStart, windowEnd, label) {
+  // Real API host is api.data.jambase.com (not data.jambase.com — that's just
+  // the docs/marketing site), and geo search uses geoLatitude/geoLongitude/
+  // geoRadiusAmount, not city/stateCode — confirmed against JamBase's live
+  // API reference (their docs are JS-rendered, so this couldn't be scraped
+  // and had to be checked by hand). Mirrors fetchTicketmasterNear's radius.
+  const params = new URLSearchParams({
+    geoLatitude: String(point.lat),
+    geoLongitude: String(point.lon),
+    geoRadiusAmount: "35",
+    geoRadiusUnits: "mi",
+  });
+  if (windowStart) params.set("eventDateFrom", windowStart);
+  if (windowEnd) params.set("eventDateTo", windowEnd);
+  const url = `https://api.data.jambase.com/v3/events?${params.toString()}`;
   console.log(`[ShowChaser] Fetching JamBase ${label}:`, url);
   let res;
   try {
-    res = await fetch(url, { headers: { Authorization: `Bearer ${JAMBASE_API_KEY}` } });
+    res = await fetch(url, { headers: { Authorization: `Bearer ${JAMBASE_API_KEY}`, Accept: "application/json" } });
   } catch (networkErr) {
     console.error(`[ShowChaser] JamBase network error (${label}) — likely blocked (CORS/sandbox):`, networkErr);
     throw new Error(`network-blocked:jambase-${label}`);
@@ -122,10 +134,11 @@ async function fetchOneJamBase(loc, label) {
   console.log(`[ShowChaser] JamBase ${label} response status:`, res.status);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    console.error(`[ShowChaser] JamBase ${label} HTTP ${res.status} — check param names against Request Builder:`, body);
+    console.error(`[ShowChaser] JamBase ${label} HTTP ${res.status}:`, body);
     throw new Error(`http-${res.status}:jambase-${label}`);
   }
-  return res.json();
+  const json = await res.json();
+  return json?.events || [];
 }
 
 /* Real deep links for the "Nearby" CTAs, built from the venue's city — we
@@ -153,12 +166,21 @@ function buildNearbyLinks(city) {
 }
 
 function transformJamBaseEvent(event) {
-  const venue = event.venue || {};
+  // JamBase's real shape nests venue info under `location` (schema.org-style:
+  // address.addressLocality/addressRegion, geo.latitude/longitude) — not the
+  // flat venue.city/venue.stateCode this originally guessed at.
+  const venue = event.location || {};
+  const address = venue.address || {};
+  const geo = venue.geo || {};
+  const city =
+    address.addressLocality && address.addressRegion?.alternateName
+      ? `${address.addressLocality}, ${address.addressRegion.alternateName}`
+      : "";
   return {
-    id: `jb-${event.identifier || event.id}`,
+    id: `jb-${event.identifier}`,
     name: event.performer?.[0]?.name || event.name || "Live Music",
     venue: venue.name || "Venue TBA",
-    city: venue.city && venue.stateCode ? `${venue.city}, ${venue.stateCode}` : "",
+    city,
     date: formatEventDate(event.startDate?.split?.("T")?.[0]),
     time: formatEventTime(event.startDate?.split?.("T")?.[1]?.slice(0, 5)),
     ages: "Check venue",
@@ -168,8 +190,10 @@ function transformJamBaseEvent(event) {
     price: "See site",
     source: "JamBase",
     ticketUrl: event.url || event.offers?.[0]?.url,
-    why: ["Found near your trip cities via JamBase", "Tickets available"],
-    nearby: buildNearbyLinks(venue.city && venue.stateCode ? `${venue.city}, ${venue.stateCode}` : ""),
+    why: ["Found along your route via JamBase", "Tickets available"],
+    nearby: buildNearbyLinks(city),
+    _lat: typeof geo.latitude === "number" ? geo.latitude : null,
+    _lon: typeof geo.longitude === "number" ? geo.longitude : null,
   };
 }
 
@@ -279,49 +303,63 @@ async function fetchRealShows({ from, to, depart, arrive }) {
   // shows from every day of the month, even days you'd already be in Chicago.
   const tripDays = depart && arrive ? daysBetween(depart, arrive) : 0;
   const bufferDays = 1;
-  const tmResults = await Promise.allSettled(
-    routePoints.map((pt, i) => {
-      let windowStart = depart;
-      let windowEnd = arrive || depart;
-      if (depart && arrive && tripDays > 0) {
-        const fraction = i / (routePoints.length - 1);
-        const estimatedOffset = Math.round(fraction * tripDays);
-        windowStart = addDays(depart, Math.max(0, estimatedOffset - bufferDays));
-        windowEnd = addDays(depart, Math.min(tripDays, estimatedOffset + bufferDays));
-      }
-      return fetchTicketmasterNear(pt, windowStart, windowEnd, `waypoint-${i}`);
-    })
-  );
+  const dateWindows = routePoints.map((pt, i) => {
+    let windowStart = depart;
+    let windowEnd = arrive || depart;
+    if (depart && arrive && tripDays > 0) {
+      const fraction = i / (routePoints.length - 1);
+      const estimatedOffset = Math.round(fraction * tripDays);
+      windowStart = addDays(depart, Math.max(0, estimatedOffset - bufferDays));
+      windowEnd = addDays(depart, Math.min(tripDays, estimatedOffset + bufferDays));
+    }
+    return { windowStart, windowEnd };
+  });
+
+  // Search both sources at every sampled waypoint (not just the two endpoint
+  // cities) — same route-based approach for JamBase as Ticketmaster now that
+  // its real geo-radius params (geoLatitude/geoLongitude/geoRadiusAmount) are
+  // confirmed working.
+  const [tmResults, jbResults] = await Promise.all([
+    Promise.allSettled(
+      routePoints.map((pt, i) =>
+        fetchTicketmasterNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`)
+      )
+    ),
+    Promise.allSettled(
+      routePoints.map((pt, i) =>
+        fetchJamBaseNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`)
+      )
+    ),
+  ]);
   tmResults.forEach((r, i) => {
     if (r.status === "rejected") console.error(`[ShowChaser] Ticketmaster waypoint-${i} failed:`, r.reason);
   });
-
-  const fromLoc = parseCityState(from);
-  const toLoc = parseCityState(to);
-  const [jbFromRes, jbToRes] = await Promise.allSettled([
-    fetchOneJamBase(fromLoc, "origin"),
-    fetchOneJamBase(toLoc, "destination"),
-  ]);
-  [
-    ["JamBase origin", jbFromRes],
-    ["JamBase destination", jbToRes],
-  ].forEach(([label, r]) => {
-    if (r.status === "rejected") console.error(`[ShowChaser] ${label} failed:`, r.reason);
+  jbResults.forEach((r, i) => {
+    if (r.status === "rejected") console.error(`[ShowChaser] JamBase waypoint-${i} failed:`, r.reason);
   });
 
-  const allFailed = tmResults.every((r) => r.status === "rejected") && jbFromRes.status === "rejected" && jbToRes.status === "rejected";
+  const allFailed = tmResults.every((r) => r.status === "rejected") && jbResults.every((r) => r.status === "rejected");
   if (allFailed) {
-    throw tmResults[0]?.reason || jbFromRes.reason;
+    throw tmResults[0]?.reason || jbResults[0]?.reason;
   }
 
   const tmCombined = tmResults.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
-  const seen = new Set();
+  const seenTM = new Set();
   const dedupedTM = tmCombined.filter((e) => {
-    if (seen.has(e.id)) return false;
-    seen.add(e.id);
+    if (seenTM.has(e.id)) return false;
+    seenTM.add(e.id);
     return true;
   });
-  const tmShows = dedupedTM.map(transformTMEvent).map((s) => {
+
+  const jbCombined = jbResults.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+  const seenJB = new Set();
+  const dedupedJB = jbCombined.filter((e) => {
+    if (seenJB.has(e.identifier)) return false;
+    seenJB.add(e.identifier);
+    return true;
+  });
+
+  const allShows = [...dedupedTM.map(transformTMEvent), ...dedupedJB.map(transformJamBaseEvent)].map((s) => {
     // Real detour: distance in miles from the venue to the nearest sampled
     // route point, converted to a rough drive-time estimate.
     if (s._lat === null || s._lat === undefined || isNaN(s._lat)) return { ...s, detour: null };
@@ -335,25 +373,11 @@ async function fetchRealShows({ from, to, depart, arrive }) {
     return { ...s, detour: detourMinutes, routePct };
   });
 
-  const jbFromEvents = jbFromRes.status === "fulfilled" ? jbFromRes.value?.data || jbFromRes.value?.events || [] : [];
-  const jbToEvents = jbToRes.status === "fulfilled" ? jbToRes.value?.data || jbToRes.value?.events || [] : [];
-  const jbShows = [...jbFromEvents, ...jbToEvents].map(transformJamBaseEvent).map((s, i, arr) => ({
-    ...s,
-    routePct: arr.length > 1 ? Math.round((i / (arr.length - 1)) * 90) + 5 : 50,
-  }));
-
   return {
-    shows: [...tmShows, ...jbShows].sort((a, b) => new Date(a.date) - new Date(b.date)),
+    shows: allShows.sort((a, b) => new Date(a.date) - new Date(b.date)),
     routeCoords,
   };
 }
-
-function parseCityState(input) {
-  const parts = (input || "").split(",").map((s) => s.trim());
-  return { city: parts[0] || "", stateCode: parts[1] || "" };
-}
-
-
 
 const TOKENS = {
   cream: "#F4EEDF",

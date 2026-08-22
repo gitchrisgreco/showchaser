@@ -16,8 +16,9 @@ Real data is wired in and working end-to-end: given a from/to city and trip
 dates, the app geocodes both cities, gets the actual driving route, samples
 points along it, and searches for real shows near each point — not just the
 two endpoints. Results show real venues, real dates, real ticket links, and
-computed detour minutes per show. There's also a real static map (Mapbox
-Static Images API) showing the actual route line and venue pins.
+computed detour minutes per show. There's also a real interactive map
+(Mapbox GL JS) showing the actual route line and tappable venue pins that
+sync with the results list.
 
 ## Tech stack
 
@@ -35,21 +36,34 @@ Static Images API) showing the actual route line and venue pins.
 - This is what makes true route-based search possible
 - Scope: searches within ~35mi of each sampled route point
 
-**JamBase Data API** — wired in but UNCONFIRMED working.
+**JamBase Data API** — fixed and route-sampled like Ticketmaster now.
 - Free Developer tier (non-commercial, 1,000 calls/mo)
-- Their docs are JS-rendered and couldn't be scraped to verify exact query
-  param names, so the integration uses a best-guess (`city`/`stateCode`
-  convention). Only Ticketmaster results have shown up in testing so far —
-  JamBase may be silently failing on wrong params. Check console logs
-  (`[ShowChaser] JamBase ... response status`) for the real HTTP status.
-  Their "Request Builder" tool on data.jambase.com would show correct params.
+- Two bugs caused it to silently return nothing: the base URL was
+  `data.jambase.com` (that's just the JS-rendered docs/marketing site) instead
+  of the real API host `api.data.jambase.com`, and the geo search used a
+  guessed `city`/`stateCode` convention that doesn't exist — real events
+  search uses `geoLatitude`/`geoLongitude`/`geoRadiusAmount`. Found by
+  loading their API reference in a real browser (it's client-rendered, so
+  plain HTML fetches only ever saw a page title) and reading the actual
+  `/events` parameter list and response schema.
+- `transformJamBaseEvent` was also reading the wrong response shape
+  (`event.venue.city`/`.stateCode`) — the real shape nests everything under
+  `event.location` (schema.org-style: `address.addressLocality`,
+  `address.addressRegion.alternateName` for the 2-letter state code,
+  `geo.latitude`/`geo.longitude`). Now extracts real venue coordinates, so
+  JamBase shows get real detour distance and map pins too, same as
+  Ticketmaster.
+- Now searches every sampled route waypoint (`fetchJamBaseNear`, ~35mi
+  radius) instead of just the two endpoint cities — matches Ticketmaster's
+  route-based approach instead of the old two-city-only search.
 - Business note: free tier is non-commercial only. Startup tier ($6,000/yr,
   $500/mo) is the real launch-time cost once the app is commercial/monetized.
 
-**Mapbox** — geocoding + driving directions + static map images.
+**Mapbox** — geocoding + driving directions + the interactive map.
 - Free tier: 100k geocoding + 100k directions requests/mo, no card required
 - Used for: turning city names into coordinates, getting the real route,
-  sampling waypoints along it, and rendering the static map image
+  sampling waypoints along it, and rendering the interactive Mapbox GL map
+  (route line + tappable venue pins) via the `mapbox-gl` package
 
 **AXS, Tixr** — no public/self-serve API for either. Both require a direct
 partnership conversation (AXS has a "partnerships/integrations" page; Tixr's
@@ -87,24 +101,19 @@ right now anyone can view-source the deployed site and see them).
 
 ## Known gaps / next steps discussed but not yet built
 
-- **JamBase actually working** — needs param verification (see above)
 - **Real match-scoring** — the UI has a match % badge concept from the
   original mockups, but real fetched shows currently show a neutral ticket
   icon instead, since no real scoring algorithm (genre overlap, detour
   distance, favorite artists) has been built yet
-- **Interactive map** — current map is a static Mapbox image (no tappable
-  pins). User explicitly wants real interactive pins eventually, but decided
-  to hold off until closer to launch since it's a bigger lift (would mean
-  adding Mapbox GL JS as a real dependency, not just an image URL)
 - **Monetization CTAs** — Hotels.com "Book" and Harvest Hosts "View" are now
   wired for real (live) shows too, not just sample data (see
   `buildNearbyLinks` in `App.jsx`). Since there's no lodging/places API
   wired in, these aren't specific named properties — they're real deep
   links to each platform's own public search, built from the venue's city:
   Hotels.com's `search.do?destination=` pattern (long-standing public URL,
-  but like JamBase, unconfirmed by an actual click-through — verify before
-  launch) and Harvest Hosts' `/discover` map (confirmed public, no login
-  required). Neither is a real affiliate link yet — Harvest Hosts pays on
+  but unconfirmed by an actual click-through — verify before launch) and
+  Harvest Hosts' `/discover` map (confirmed public, no login required).
+  Neither is a real affiliate link yet — Harvest Hosts pays on
   membership referral, not per-stay, so a real affiliate/referral ID still
   needs to be added once the account exists. Hipcamp is intentionally left
   out of the live wiring — no clean self-serve affiliate path yet, only an
