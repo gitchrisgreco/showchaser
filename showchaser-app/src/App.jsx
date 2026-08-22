@@ -273,7 +273,34 @@ function buildStaticMapUrl({ routeCoords, shows, selectedId, width = 640, height
   const decimated = decimateCoords(routeCoords, 100);
   const encoded = encodePolyline(decimated.map(([lon, lat]) => [lat, lon]));
   const pathOverlay = `path-3+c1440e-0.85(${encodeURIComponent(encoded)})`;
-  const pinnable = shows.filter((s) => typeof s._lat === "number" && !isNaN(s._lat)).slice(0, 15);
+
+  // Dedupe shows at the same venue (many events, one pin), then spread pins
+  // across the WHOLE route rather than just the first N by date — otherwise
+  // a date-sorted cap clusters every pin near the start of a long trip and
+  // never reaches shows later in the date range, near the destination.
+  const withCoords = shows.filter((s) => typeof s._lat === "number" && !isNaN(s._lat));
+  const seenLoc = new Set();
+  const uniqueByVenue = withCoords.filter((s) => {
+    const key = `${s._lat.toFixed(2)},${s._lon.toFixed(2)}`;
+    if (seenLoc.has(key)) return false;
+    seenLoc.add(key);
+    return true;
+  });
+  const maxPins = 30;
+  let pinnable = uniqueByVenue;
+  if (uniqueByVenue.length > maxPins) {
+    // Take an evenly-spaced sample across the route-sorted list so pins
+    // span the full trip instead of bunching at one end.
+    const byRoutePosition = [...uniqueByVenue].sort((a, b) => (a.routePct ?? 0) - (b.routePct ?? 0));
+    const step = (byRoutePosition.length - 1) / (maxPins - 1);
+    pinnable = Array.from({ length: maxPins }, (_, i) => byRoutePosition[Math.round(i * step)]);
+  }
+  // Always make sure the currently-selected show has a pin, even if it got sampled out.
+  if (selectedId && !pinnable.some((s) => s.id === selectedId)) {
+    const sel = withCoords.find((s) => s.id === selectedId);
+    if (sel) pinnable = [...pinnable, sel];
+  }
+
   const markerOverlays = pinnable.map((s) => {
     const color = s.id === selectedId ? "c1440e" : "2e4634";
     return `pin-s+${color}(${s._lon.toFixed(4)},${s._lat.toFixed(4)})`;
