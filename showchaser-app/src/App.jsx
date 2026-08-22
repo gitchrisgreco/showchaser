@@ -128,6 +128,30 @@ async function fetchOneJamBase(loc, label) {
   return res.json();
 }
 
+/* Real deep links for the "Nearby" CTAs, built from the venue's city — we
+   don't have a places/lodging API wired in, so these point at each
+   platform's own public search rather than specific named properties.
+   Hotels.com's search.do URL is a long-standing public pattern but,
+   like JamBase, hasn't been click-tested end to end — verify before launch.
+   Harvest Hosts' /discover map is confirmed public (no login required). */
+function buildNearbyLinks(city) {
+  if (!city) return [];
+  return [
+    {
+      label: `Hotels near ${city}`,
+      type: "lodge",
+      platform: "Hotels.com",
+      url: `https://www.hotels.com/search.do?destination=${encodeURIComponent(city)}`,
+    },
+    {
+      label: `Harvest Hosts near ${city}`,
+      type: "harvest",
+      platform: "Harvest Hosts",
+      url: "https://www.harvesthosts.com/discover",
+    },
+  ];
+}
+
 function transformJamBaseEvent(event) {
   const venue = event.venue || {};
   return {
@@ -145,7 +169,7 @@ function transformJamBaseEvent(event) {
     source: "JamBase",
     ticketUrl: event.url || event.offers?.[0]?.url,
     why: ["Found near your trip cities via JamBase", "Tickets available"],
-    nearby: [],
+    nearby: buildNearbyLinks(venue.city && venue.stateCode ? `${venue.city}, ${venue.stateCode}` : ""),
   };
 }
 
@@ -186,7 +210,7 @@ function transformTMEvent(event) {
     source: "Ticketmaster",
     ticketUrl: event.url,
     why: ["Found along your route via Ticketmaster", "Tickets available"],
-    nearby: [],
+    nearby: buildNearbyLinks(venue?.city?.name && venue?.state?.stateCode ? `${venue.city.name}, ${venue.state.stateCode}` : ""),
     _lat: venueLoc ? parseFloat(venueLoc.latitude) : null,
     _lon: venueLoc ? parseFloat(venueLoc.longitude) : null,
   };
@@ -1165,42 +1189,49 @@ function ShowDetailScreen({ show, onBack, saved, onToggleSave }) {
           </div>
         </div>
 
-        <div className="mt-5">
-          <div className="flex items-center justify-between">
-            <span style={{ fontSize: 11, fontWeight: 700, color: TOKENS.brown, letterSpacing: 0.4 }}>NEARBY</span>
-            <span style={{ fontSize: 11.5, color: TOKENS.rust, fontWeight: 700 }}>View map</span>
-          </div>
-          <div className="flex flex-col gap-2 mt-2">
-            {show.nearby.map((n, i) => {
-              const cta =
-                n.type === "camp" || n.type === "lodge" ? "Book" : n.type === "harvest" ? "View" : null;
-              return (
-                <div key={i} className="flex items-center justify-between">
-                  <div>
-                    <div style={{ fontSize: 13, color: TOKENS.ink }}>{n.label}</div>
-                    <div className="flex items-center gap-1.5 mt-0.5">
-                      <span style={{ fontSize: 11.5, color: TOKENS.brown }}>
-                        {n.mins} min{n.type === "harvest" ? " · free stay for members" : ""}
-                      </span>
-                      {n.platform && <SourceTag source={n.platform} />}
+        {show.nearby.length > 0 && (
+          <div className="mt-5">
+            <div className="flex items-center justify-between">
+              <span style={{ fontSize: 11, fontWeight: 700, color: TOKENS.brown, letterSpacing: 0.4 }}>NEARBY</span>
+              <span style={{ fontSize: 11.5, color: TOKENS.rust, fontWeight: 700 }}>View map</span>
+            </div>
+            <div className="flex flex-col gap-2 mt-2">
+              {show.nearby.map((n, i) => {
+                const cta =
+                  n.type === "camp" || n.type === "lodge" ? "Book" : n.type === "harvest" ? "View" : null;
+                return (
+                  <div key={i} className="flex items-center justify-between">
+                    <div>
+                      <div style={{ fontSize: 13, color: TOKENS.ink }}>{n.label}</div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span style={{ fontSize: 11.5, color: TOKENS.brown }}>
+                          {typeof n.mins === "number"
+                            ? `${n.mins} min${n.type === "harvest" ? " · free stay for members" : ""}`
+                            : n.type === "harvest"
+                            ? "Free stay for members"
+                            : "Search results"}
+                        </span>
+                        {n.platform && <SourceTag source={n.platform} />}
+                      </div>
                     </div>
+                    {cta && (
+                      <button
+                        onClick={() => n.url && window.open(n.url, "_blank", "noopener,noreferrer")}
+                        className="px-3 py-1.5 rounded-full text-xs font-bold shrink-0"
+                        style={{
+                          background: n.type === "harvest" ? TOKENS.pine : TOKENS.sand,
+                          color: n.type === "harvest" ? TOKENS.cream : TOKENS.ink,
+                        }}
+                      >
+                        {cta}
+                      </button>
+                    )}
                   </div>
-                  {cta && (
-                    <button
-                      className="px-3 py-1.5 rounded-full text-xs font-bold shrink-0"
-                      style={{
-                        background: n.type === "harvest" ? TOKENS.pine : TOKENS.sand,
-                        color: n.type === "harvest" ? TOKENS.cream : TOKENS.ink,
-                      }}
-                    >
-                      {cta}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       <div className="px-5 pb-5 pt-2 flex flex-col gap-2">
