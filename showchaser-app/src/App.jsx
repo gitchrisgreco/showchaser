@@ -1,9 +1,11 @@
-import React, { useState, useMemo, useRef } from "react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
 import {
   Music, MapPin, Calendar as CalendarIcon, Search, Heart, Share2,
   ArrowLeft, Bell, Home as HomeIcon, Map as MapIcon, List as ListIcon,
   Bookmark, User, Ticket, Navigation, Mountain, Sparkles, X, ChevronRight
 } from "lucide-react";
+import mapboxgl from "mapbox-gl";
+import "mapbox-gl/dist/mapbox-gl.css";
 
 /* ---------------------------------------------------------
    ShowChaser — road-trip live music discovery, prototype
@@ -37,6 +39,7 @@ const JAMBASE_API_KEY = "jbd_trial_9gvrBZCl1T5t_xH4X0a5ADxImA4jIlrpj5Vogm7mxPVTf
    real driving route, so Ticketmaster search can sample points along the
    actual path instead of just the two endpoint cities. */
 const MAPBOX_TOKEN = "pk.eyJ1IjoiY2hyaXNncmVjbzE0IiwiYSI6ImNtdDNkN3gwMzB1cjYyd3B3MjViMzdoNzAifQ.A1rG5SDaiZolTNVUsdmvdg";
+mapboxgl.accessToken = MAPBOX_TOKEN;
 
 async function geocodePlace(query, label) {
   const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_TOKEN}&country=US&limit=1`;
@@ -232,81 +235,6 @@ async function fetchTicketmasterNear(point, windowStart, windowEnd, label) {
   const json = await res.json();
   console.log(`[ShowChaser] Ticketmaster ${label} events found:`, json?._embedded?.events?.length || 0);
   return json?._embedded?.events || [];
-}
-
-function encodePolyline(points) {
-  // Standard encoded-polyline algorithm (precision 5), points as [lat, lon].
-  let output = "";
-  let prevLat = 0;
-  let prevLon = 0;
-  const encodeValue = (val) => {
-    let v = val < 0 ? ~(val << 1) : val << 1;
-    let result = "";
-    while (v >= 0x20) {
-      result += String.fromCharCode((0x20 | (v & 0x1f)) + 63);
-      v >>= 5;
-    }
-    result += String.fromCharCode(v + 63);
-    return result;
-  };
-  for (const [lat, lon] of points) {
-    const latInt = Math.round(lat * 1e5);
-    const lonInt = Math.round(lon * 1e5);
-    output += encodeValue(latInt - prevLat);
-    output += encodeValue(lonInt - prevLon);
-    prevLat = latInt;
-    prevLon = lonInt;
-  }
-  return output;
-}
-
-function decimateCoords(coords, maxPoints) {
-  if (coords.length <= maxPoints) return coords;
-  const step = (coords.length - 1) / (maxPoints - 1);
-  const out = [];
-  for (let i = 0; i < maxPoints; i++) out.push(coords[Math.round(i * step)]);
-  return out;
-}
-
-function buildStaticMapUrl({ routeCoords, shows, selectedId, width = 640, height = 420 }) {
-  if (!routeCoords || routeCoords.length === 0) return null;
-  const decimated = decimateCoords(routeCoords, 100);
-  const encoded = encodePolyline(decimated.map(([lon, lat]) => [lat, lon]));
-  const pathOverlay = `path-3+c1440e-0.85(${encodeURIComponent(encoded)})`;
-
-  // Dedupe shows at the same venue (many events, one pin), then spread pins
-  // across the WHOLE route rather than just the first N by date — otherwise
-  // a date-sorted cap clusters every pin near the start of a long trip and
-  // never reaches shows later in the date range, near the destination.
-  const withCoords = shows.filter((s) => typeof s._lat === "number" && !isNaN(s._lat));
-  const seenLoc = new Set();
-  const uniqueByVenue = withCoords.filter((s) => {
-    const key = `${s._lat.toFixed(2)},${s._lon.toFixed(2)}`;
-    if (seenLoc.has(key)) return false;
-    seenLoc.add(key);
-    return true;
-  });
-  const maxPins = 30;
-  let pinnable = uniqueByVenue;
-  if (uniqueByVenue.length > maxPins) {
-    // Take an evenly-spaced sample across the route-sorted list so pins
-    // span the full trip instead of bunching at one end.
-    const byRoutePosition = [...uniqueByVenue].sort((a, b) => (a.routePct ?? 0) - (b.routePct ?? 0));
-    const step = (byRoutePosition.length - 1) / (maxPins - 1);
-    pinnable = Array.from({ length: maxPins }, (_, i) => byRoutePosition[Math.round(i * step)]);
-  }
-  // Always make sure the currently-selected show has a pin, even if it got sampled out.
-  if (selectedId && !pinnable.some((s) => s.id === selectedId)) {
-    const sel = withCoords.find((s) => s.id === selectedId);
-    if (sel) pinnable = [...pinnable, sel];
-  }
-
-  const markerOverlays = pinnable.map((s) => {
-    const color = s.id === selectedId ? "c1440e" : "2e4634";
-    return `pin-s+${color}(${s._lon.toFixed(4)},${s._lat.toFixed(4)})`;
-  });
-  const overlay = [pathOverlay, ...markerOverlays].join(",");
-  return `https://api.mapbox.com/styles/v1/mapbox/light-v11/static/${overlay}/auto/${width}x${height}@2x?padding=50&access_token=${MAPBOX_TOKEN}`;
 }
 
 async function fetchRealShows({ from, to, depart, arrive }) {
@@ -865,20 +793,133 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
   );
 }
 
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function InteractiveRouteMap({ shows, selectedId, onSelect, routeCoords }) {
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const markersRef = useRef([]);
+
+  // One pin per venue (many events can share a venue) so the map doesn't
+  // stack duplicate markers on top of each other.
+  const pins = useMemo(() => {
+    const withCoords = shows.filter((s) => typeof s._lat === "number" && !isNaN(s._lat));
+    const byVenue = new Map();
+    for (const s of withCoords) {
+      const key = `${s._lat.toFixed(3)},${s._lon.toFixed(3)}`;
+      if (!byVenue.has(key)) byVenue.set(key, s);
+    }
+    return [...byVenue.values()];
+  }, [shows]);
+
+  // Create the map once and tear it down on unmount.
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) return;
+    const map = new mapboxgl.Map({
+      container: containerRef.current,
+      style: "mapbox://styles/mapbox/light-v11",
+      center: routeCoords[Math.floor(routeCoords.length / 2)] || [-98.5, 39.8],
+      zoom: 4,
+    });
+    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "top-right");
+    mapRef.current = map;
+    return () => {
+      map.remove();
+      mapRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Draw the route line and fit the map to it whenever the route changes.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !routeCoords || routeCoords.length === 0) return;
+
+    const drawRoute = () => {
+      const geojson = { type: "Feature", geometry: { type: "LineString", coordinates: routeCoords } };
+      if (map.getSource("route")) {
+        map.getSource("route").setData(geojson);
+      } else {
+        map.addSource("route", { type: "geojson", data: geojson });
+        map.addLayer({
+          id: "route-line",
+          type: "line",
+          source: "route",
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: { "line-color": TOKENS.rust, "line-width": 4, "line-opacity": 0.85 },
+        });
+      }
+      const bounds = routeCoords.reduce(
+        (b, c) => b.extend(c),
+        new mapboxgl.LngLatBounds(routeCoords[0], routeCoords[0])
+      );
+      map.fitBounds(bounds, { padding: 50, duration: 0 });
+    };
+
+    if (map.isStyleLoaded()) drawRoute();
+    else map.once("load", drawRoute);
+  }, [routeCoords]);
+
+  // (Re)draw venue markers whenever the pin set or selection changes.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const placeMarkers = () => {
+      markersRef.current.forEach((m) => m.remove());
+      markersRef.current = pins.map((s) => {
+        const isSelected = s.id === selectedId;
+        const el = document.createElement("button");
+        el.type = "button";
+        el.setAttribute("aria-label", `${s.venue} — ${s.name}`);
+        el.style.width = isSelected ? "28px" : "20px";
+        el.style.height = isSelected ? "28px" : "20px";
+        el.style.borderRadius = "9999px";
+        el.style.border = `2px solid ${TOKENS.cream}`;
+        el.style.background = isSelected ? TOKENS.rust : TOKENS.pine;
+        el.style.boxShadow = "0 1px 4px rgba(0,0,0,0.35)";
+        el.style.cursor = "pointer";
+        el.style.padding = "0";
+        el.onclick = (e) => {
+          e.stopPropagation();
+          onSelect(s.id);
+        };
+
+        const popup = new mapboxgl.Popup({ offset: 16, closeButton: false }).setHTML(
+          `<div style="font:600 12px Inter, sans-serif; color:${TOKENS.ink}">${escapeHtml(s.venue)}<br/><span style="font-weight:400">${escapeHtml(s.name)}</span></div>`
+        );
+
+        return new mapboxgl.Marker(el).setLngLat([s._lon, s._lat]).setPopup(popup).addTo(map);
+      });
+    };
+
+    if (map.isStyleLoaded()) placeMarkers();
+    else map.once("load", placeMarkers);
+  }, [pins, selectedId, onSelect]);
+
+  // Pan/zoom to whichever show is selected from the results list.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !selectedId || !map.isStyleLoaded()) return;
+    const sel = pins.find((s) => s.id === selectedId);
+    if (sel) map.easeTo({ center: [sel._lon, sel._lat], zoom: Math.max(map.getZoom(), 7), duration: 500 });
+  }, [selectedId, pins]);
+
+  return <div ref={containerRef} className="w-full h-full" />;
+}
+
 function RouteMap({ shows, selectedId, onSelect, routeCoords }) {
   // Real map: when we have an actual driving route (live search), render a
-  // genuine Mapbox static image with the real path and real venue pins.
+  // genuine interactive Mapbox GL map — draggable/zoomable, with real venue
+  // pins the user can tap directly.
   if (routeCoords && routeCoords.length > 0) {
-    const mapUrl = buildStaticMapUrl({ routeCoords, shows, selectedId });
     return (
       <div className="rounded-2xl overflow-hidden" style={{ height: 230, background: TOKENS.sand }}>
-        {mapUrl && (
-          <img
-            src={mapUrl}
-            alt="Map of your route with nearby shows"
-            className="w-full h-full object-cover"
-          />
-        )}
+        <InteractiveRouteMap shows={shows} selectedId={selectedId} onSelect={onSelect} routeCoords={routeCoords} />
       </div>
     );
   }
