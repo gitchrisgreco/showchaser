@@ -145,8 +145,13 @@ async function fetchJamBaseNear(point, windowStart, windowEnd, label) {
    don't have a places/lodging API wired in, so these point at each
    platform's own public search rather than specific named properties.
    Hotels.com's search.do URL is a long-standing public pattern but,
-   like JamBase, hasn't been click-tested end to end — verify before launch.
-   Harvest Hosts' /discover map is confirmed public (no login required). */
+   hasn't been click-tested end to end — verify before launch.
+   Harvest Hosts' /discover map is confirmed public (no login required).
+   Hipcamp's link is a real Sovrn Commerce affiliate link, but it's
+   currently a single static redirect (to hipcamp.com's homepage) used to
+   verify site ownership during Sovrn onboarding — it doesn't vary by city
+   yet like the other two. Swap in a proper per-city wrapped link (or their
+   auto-tagging snippet) once the Sovrn account is fully approved. */
 function buildNearbyLinks(city) {
   if (!city) return [];
   return [
@@ -155,6 +160,12 @@ function buildNearbyLinks(city) {
       type: "lodge",
       platform: "Hotels.com",
       url: `https://www.hotels.com/search.do?destination=${encodeURIComponent(city)}`,
+    },
+    {
+      label: `Camping near ${city}`,
+      type: "camp",
+      platform: "Hipcamp",
+      url: "https://sovrn.co/1gwx2df",
     },
     {
       label: `Harvest Hosts near ${city}`,
