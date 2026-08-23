@@ -790,6 +790,7 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
                 type="date"
                 value={form.depart}
                 onChange={(e) => setForm((f) => ({ ...f, depart: e.target.value }))}
+                onClick={(e) => e.currentTarget.showPicker?.()}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 aria-label="Depart date"
               />
@@ -805,6 +806,7 @@ function TripFormScreen({ onBack, onSubmit, form, setForm }) {
                 type="date"
                 value={form.arrive}
                 onChange={(e) => setForm((f) => ({ ...f, arrive: e.target.value }))}
+                onClick={(e) => e.currentTarget.showPicker?.()}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 aria-label="Arrive date"
               />
