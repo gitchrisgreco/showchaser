@@ -108,7 +108,24 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function fetchJamBaseNear(point, windowStart, windowEnd, label) {
+const BACKROAD_MPH = 35; // rough average speed assumption, shared by the detour-time estimate and the max-detour -> search-radius conversion below
+
+function maxDetourMinutes(maxDetour) {
+  if (maxDetour === "Unlimited") return null;
+  const minutes = parseInt(maxDetour, 10);
+  return Number.isNaN(minutes) ? null : minutes;
+}
+
+function maxDetourRadiusMiles(maxDetour) {
+  const minutes = maxDetourMinutes(maxDetour);
+  // "Unlimited" still needs a bounded radius to actually search — generous
+  // enough to cover any real detour tolerance, without pulling in shows so
+  // far off-route they're irrelevant to a road trip.
+  if (minutes === null) return 75;
+  return Math.max(10, Math.round((minutes / 60) * BACKROAD_MPH));
+}
+
+async function fetchJamBaseNear(point, windowStart, windowEnd, label, radiusMiles) {
   // Real API host is api.data.jambase.com (not data.jambase.com — that's just
   // the docs/marketing site), and geo search uses geoLatitude/geoLongitude/
   // geoRadiusAmount, not city/stateCode — confirmed against JamBase's live
@@ -117,7 +134,7 @@ async function fetchJamBaseNear(point, windowStart, windowEnd, label) {
   const params = new URLSearchParams({
     geoLatitude: String(point.lat),
     geoLongitude: String(point.lon),
-    geoRadiusAmount: "35",
+    geoRadiusAmount: String(radiusMiles),
     geoRadiusUnits: "mi",
   });
   if (windowStart) params.set("eventDateFrom", windowStart);
@@ -269,7 +286,7 @@ function daysBetween(start, end) {
   return Math.round((d2 - d1) / 86400000);
 }
 
-async function fetchTicketmasterNear(point, windowStart, windowEnd, label) {
+async function fetchTicketmasterNear(point, windowStart, windowEnd, label, radiusMiles) {
   const startDateTime = windowStart ? `${windowStart}T00:00:00Z` : undefined;
   const endDateTime = windowEnd ? `${windowEnd}T23:59:59Z` : undefined;
   const params = new URLSearchParams({
@@ -277,7 +294,7 @@ async function fetchTicketmasterNear(point, windowStart, windowEnd, label) {
     classificationName: "music",
     size: "20",
     latlong: `${point.lat},${point.lon}`,
-    radius: "35",
+    radius: String(radiusMiles),
     unit: "miles",
   });
   if (startDateTime) params.set("startDateTime", startDateTime);
@@ -302,13 +319,15 @@ async function fetchTicketmasterNear(point, windowStart, windowEnd, label) {
   return json?._embedded?.events || [];
 }
 
-async function fetchRealShows({ from, to, depart, arrive }) {
+async function fetchRealShows({ from, to, depart, arrive, maxDetour }) {
   // Step 1: geocode both endpoints, then get the real driving route between them.
   const [fromCoord, toCoord] = await Promise.all([
     geocodePlace(from, "origin"),
     geocodePlace(to, "destination"),
   ]);
   const routeCoords = await getDrivingRoute(fromCoord, toCoord);
+  const searchRadiusMiles = maxDetourRadiusMiles(maxDetour);
+  const detourCapMinutes = maxDetourMinutes(maxDetour);
 
   // Step 2: sample ~6 points along the actual route (not just the two ends).
   const routePoints = sampleRoutePoints(routeCoords, 6);
@@ -339,12 +358,12 @@ async function fetchRealShows({ from, to, depart, arrive }) {
   const [tmResults, jbResults] = await Promise.all([
     Promise.allSettled(
       routePoints.map((pt, i) =>
-        fetchTicketmasterNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`)
+        fetchTicketmasterNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`, searchRadiusMiles)
       )
     ),
     Promise.allSettled(
       routePoints.map((pt, i) =>
-        fetchJamBaseNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`)
+        fetchJamBaseNear(pt, dateWindows[i].windowStart, dateWindows[i].windowEnd, `waypoint-${i}`, searchRadiusMiles)
       )
     ),
   ]);
@@ -382,7 +401,7 @@ async function fetchRealShows({ from, to, depart, arrive }) {
     if (s._lat === null || s._lat === undefined || isNaN(s._lat)) return { ...s, detour: null };
     const distances = routePoints.map((pt) => haversineMiles(s._lat, s._lon, pt.lat, pt.lon));
     const minMiles = Math.min(...distances);
-    const detourMinutes = Math.round((minMiles / 35) * 60); // rough backroad-speed estimate
+    const detourMinutes = Math.round((minMiles / BACKROAD_MPH) * 60);
     // Position along the route for the map display, based on which sampled
     // point the venue is closest to.
     const nearestIdx = distances.indexOf(minMiles);
@@ -390,8 +409,14 @@ async function fetchRealShows({ from, to, depart, arrive }) {
     return { ...s, detour: detourMinutes, routePct };
   });
 
+  // Enforce the user's actual max-detour choice — the search radius above
+  // bounds what we fetch (and keeps API usage sane for tight tolerances),
+  // but this is what guarantees no show over the stated limit ever shows up.
+  const withinDetour =
+    detourCapMinutes === null ? allShows : allShows.filter((s) => s.detour === null || s.detour <= detourCapMinutes);
+
   return {
-    shows: allShows.sort((a, b) => new Date(a.date) - new Date(b.date)),
+    shows: withinDetour.sort((a, b) => new Date(a.date) - new Date(b.date)),
     routeCoords,
   };
 }
